@@ -1,0 +1,17 @@
+[Unit]
+Description=ETL Loader Service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/etl_loader
+User=etluser
+Group=etluser
+ExecStart=/opt/etl_loader/venv/bin/python /opt/etl_loader/etl.py --config /opt/etl_loader/config.yaml
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

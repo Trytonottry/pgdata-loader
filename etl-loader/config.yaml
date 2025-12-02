@@ -1,0 +1,11 @@
+# /opt/etl_loader/config.yaml
+data_dir: /opt/data
+pg_url: postgresql+psycopg2://postgres:password@127.0.0.1:5432/bigdata
+workers: 6
+batch_size: 5000
+use_copy: true
+tmp_dir: /opt/etl_loader/tmp
+monitor_host: 0.0.0.0
+monitor_port: 8080
+log_file: /opt/etl_loader/logs/etl.log
+error_log: /opt/etl_loader/logs/errors.log

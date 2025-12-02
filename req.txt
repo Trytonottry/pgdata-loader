@@ -1,0 +1,7 @@
+psycopg2-binary
+pandas
+openpyxl
+xlrd
+orjson
+tqdm
+python-dateutil

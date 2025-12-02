@@ -1,0 +1,16 @@
+[Unit]
+Description=ETL Monitor (FastAPI)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/etl_loader
+User=etluser
+Group=etluser
+ExecStart=/opt/etl_loader/venv/bin/uvicorn monitor_api:app --host 0.0.0.0 --port 8080
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
