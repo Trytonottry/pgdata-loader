@@ -4,6 +4,11 @@ pg_url: postgresql+psycopg2://postgres:password@127.0.0.1:5432/bigdata
 workers: 6
 batch_size: 5000
 use_copy: true
+compute_hash: false
+writer_batch_files: 8
+writer_batch_timeout_sec: 1.0
+queue_task_maxsize: 0
+queue_meta_maxsize: 0
 tmp_dir: /opt/etl_loader/tmp
 monitor_host: 0.0.0.0
 monitor_port: 8080
