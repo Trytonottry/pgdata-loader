@@ -19,7 +19,7 @@ from typing import Dict, Any
 import psycopg2
 import psycopg2.extras
 import pandas as pd
-from prometheus_client import Counter, Gauge
+from prometheus_client import Counter
 from utils.logging import setup_logging
 
 # Metrics (Prometheus)
@@ -30,7 +30,13 @@ FILES_FAILED = Counter('etl_files_failed_total', 'Files failed')
 # ---------------- utils ----------------
 def load_config(path: str):
     with open(path, 'r') as f:
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f)
+    cfg.setdefault('compute_hash', False)
+    cfg.setdefault('writer_batch_files', 8)
+    cfg.setdefault('writer_batch_timeout_sec', 1.0)
+    cfg.setdefault('queue_task_maxsize', 0)
+    cfg.setdefault('queue_meta_maxsize', 0)
+    return cfg
 
 def compute_sha256(path: Path, block=65536):
     h = hashlib.sha256()
@@ -50,8 +56,8 @@ def pg_conn_from_sqlalchemy_url(pg_url: str):
 # ---------------- Parsers (streaming) ----------------
 def iter_csv(path: Path, chunksize=10000):
     for chunk in pd.read_csv(path, chunksize=chunksize, dtype=str, keep_default_na=False, low_memory=False, encoding='utf-8'):
-        for idx, row in chunk.iterrows():
-            yield row.to_dict()
+        for row in chunk.to_dict(orient='records'):
+            yield row
 
 def iter_json_or_jsonl(path: Path):
     with path.open('r', encoding='utf-8', errors='replace') as f:
@@ -67,7 +73,7 @@ def iter_json_or_jsonl(path: Path):
                 if not line:
                     continue
                 try:
-                    yield json.loads(line)
+                    yield orjson.loads(line)
                 except:
                     yield {'line': line}
 
@@ -78,7 +84,7 @@ def iter_gz(path: Path):
             if not line:
                 continue
             try:
-                yield json.loads(line)
+                yield orjson.loads(line)
             except:
                 yield {'line': line}
 
@@ -87,23 +93,23 @@ def iter_xlsx(path: Path):
     for sheet in xls.sheet_names:
         try:
             for chunk in pd.read_excel(xls, sheet_name=sheet, chunksize=10000, dtype=str, engine='openpyxl', keep_default_na=False):
-                for _, row in chunk.iterrows():
-                    yield row.to_dict()
+                for row in chunk.to_dict(orient='records'):
+                    yield row
         except ValueError:
             df = pd.read_excel(xls, sheet_name=sheet, engine='openpyxl', dtype=str, keep_default_na=False)
-            for _, row in df.iterrows():
-                yield row.to_dict()
+            for row in df.to_dict(orient='records'):
+                yield row
 
 def iter_parquet(path: Path):
     # pandas reading; may require pyarrow or fastparquet
     try:
         for chunk in pd.read_parquet(path, chunksize=10000):
-            for _, row in chunk.iterrows():
-                yield row.to_dict()
+            for row in chunk.to_dict(orient='records'):
+                yield row
     except Exception:
         df = pd.read_parquet(path)
-        for _, row in df.iterrows():
-            yield row.to_dict()
+        for row in df.to_dict(orient='records'):
+            yield row
 
 def iter_sqlite(path: Path):
     import sqlite3
@@ -113,8 +119,8 @@ def iter_sqlite(path: Path):
     tables = [r[0] for r in cur.fetchall()]
     for t in tables:
         for chunk in pd.read_sql_query(f'SELECT * FROM "{t}"', con, chunksize=10000):
-            for _, row in chunk.iterrows():
-                yield row.to_dict()
+            for row in chunk.to_dict(orient='records'):
+                yield row
     con.close()
 
 # dispatch
@@ -150,7 +156,7 @@ def worker_proc(task_q: Queue, meta_q: Queue, tmpdir: str, cfg: Dict[str,Any], s
             break
         p = Path(path)
         try:
-            sha = compute_sha256(p)
+            sha = compute_sha256(p) if cfg.get('compute_hash', False) else None
             rows = 0
             tfile = Path(tmpdir) / f"tmp_{os.getpid()}_{int(time.time()*1000)}.tsv"
             tfile.parent.mkdir(parents=True, exist_ok=True)
@@ -195,10 +201,58 @@ def writer_proc(meta_q: Queue, cfg: Dict[str,Any], stop_event: Event):
         logger.exception("writer DB init failed")
         raise
 
-    while not stop_event.is_set() or not meta_q.empty():
+    writer_batch_files = max(1, int(cfg.get('writer_batch_files', 8)))
+    writer_batch_timeout = float(cfg.get('writer_batch_timeout_sec', 1.0))
+    pending = []
+    last_flush = time.monotonic()
+
+    def flush_pending(batch):
+        if not batch:
+            return
+        copied = []
+        total_rows = 0
+        try:
+            for meta in batch:
+                tmpfile = meta.get('tmpfile')
+                with open(tmpfile, 'r', encoding='utf-8') as f:
+                    cur.copy_expert("COPY raw_rows (source_file, data) FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', QUOTE '\"')", f)
+                copied.append(meta)
+                total_rows += int(meta.get('rows', 0) or 0)
+            conn.commit()
+            ROWS_IMPORTED.inc(total_rows)
+            FILES_PROCESSED.inc(len(copied))
+            for meta in copied:
+                source_file = meta.get('source_file')
+                tmpfile = meta.get('tmpfile')
+                logger.info(f"Imported {meta.get('rows', 0)} rows from {source_file}")
+                try:
+                    os.remove(tmpfile)
+                except:
+                    pass
+        except Exception as e:
+            conn.rollback()
+            logger.exception(f"writer failed import batch: {e}")
+            err_dir = Path(cfg['tmp_dir']) / "failed"
+            err_dir.mkdir(parents=True, exist_ok=True)
+            for meta in batch:
+                FILES_FAILED.inc()
+                source_file = meta.get('source_file')
+                tmpfile = meta.get('tmpfile')
+                try:
+                    shutil.move(tmpfile, err_dir / Path(tmpfile).name)
+                except Exception:
+                    pass
+                with open(cfg['error_log'], 'a', encoding='utf-8') as ef:
+                    ef.write(json.dumps({'ts': datetime.utcnow().isoformat()+'Z','file': source_file, 'error': str(e)}) + "\n")
+
+    while not stop_event.is_set() or not meta_q.empty() or pending:
         try:
             meta = meta_q.get(timeout=1)
         except Exception:
+            if pending and (time.monotonic() - last_flush) >= writer_batch_timeout:
+                flush_pending(pending)
+                pending = []
+                last_flush = time.monotonic()
             continue
         if meta == "STOP":
             break
@@ -206,33 +260,14 @@ def writer_proc(meta_q: Queue, cfg: Dict[str,Any], stop_event: Event):
             logger.error(f"Worker error: {meta.get('error')} file={meta.get('file')}")
             FILES_FAILED.inc()
             continue
-        tmpfile = meta.get('tmpfile')
-        rows = meta.get('rows', 0)
-        source_file = meta.get('source_file')
-        try:
-            # Use COPY
-            with open(tmpfile, 'r', encoding='utf-8') as f:
-                cur.copy_expert("COPY raw_rows (source_file, data) FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', QUOTE '\"')", f)
-                conn.commit()
-            ROWS_IMPORTED.inc(rows)
-            FILES_PROCESSED.inc()
-            logger.info(f"Imported {rows} rows from {source_file}")
-            # remove tmp
-            try:
-                os.remove(tmpfile)
-            except:
-                pass
-        except Exception as e:
-            conn.rollback()
-            logger.exception(f"writer failed import tmpfile {tmpfile}: {e}")
-            FILES_FAILED.inc()
-            # move tmpfile to errors area for manual inspection
-            err_dir = Path(cfg['tmp_dir']) / "failed"
-            err_dir.mkdir(parents=True, exist_ok=True)
-            shutil.move(tmpfile, err_dir / Path(tmpfile).name)
-            # write error log
-            with open(cfg['error_log'], 'a', encoding='utf-8') as ef:
-                ef.write(json.dumps({'ts': datetime.utcnow().isoformat()+'Z','file': source_file, 'error': str(e)}) + "\n")
+        pending.append(meta)
+        if len(pending) >= writer_batch_files or (time.monotonic() - last_flush) >= writer_batch_timeout:
+            flush_pending(pending)
+            pending = []
+            last_flush = time.monotonic()
+
+    if pending:
+        flush_pending(pending)
 
     try:
         cur.close()
@@ -265,8 +300,9 @@ def main():
     tmpdir = cfg.get('tmp_dir') or tempfile.mkdtemp(prefix='etl_tmp_')
     Path(tmpdir).mkdir(parents=True, exist_ok=True)
 
-    task_q = Queue()
-    meta_q = Queue()
+    workers_n = cfg.get('workers', max(2, cpu_count()-1))
+    task_q = Queue(maxsize=int(cfg.get('queue_task_maxsize', 0)))
+    meta_q = Queue(maxsize=int(cfg.get('queue_meta_maxsize', 0)))
     stop_event = Event()
 
     # spawn writer
@@ -275,17 +311,17 @@ def main():
 
     # spawn workers
     workers = []
-    workers_n = cfg.get('workers', max(2, cpu_count()-1))
     for i in range(workers_n):
         p = Process(target=worker_proc, args=(task_q, meta_q, tmpdir, cfg, stop_event), daemon=True)
         p.start()
         workers.append(p)
 
-    # enqueue files (optionally compute hash to skip existing — currently not skipping)
-    files = list(find_files(cfg['data_dir']))
-    logger.info(f"Found {len(files)} files")
-    for f in files:
+    # enqueue files as stream (avoid loading full list to memory)
+    files_count = 0
+    for f in find_files(cfg['data_dir']):
         task_q.put(f)
+        files_count += 1
+    logger.info(f"Found {files_count} files")
 
     # send STOP to workers
     for _ in workers:
